@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Dada Life — Crash &amp; Smile</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; background: #140b06; overflow: hidden; }
+  body { display: grid; place-items: center; }
+  canvas {
+    width: min(100vw, calc(100vh * 1706 / 922));
+    height: auto;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="c" width="1706" height="922" title="click to replay"></canvas>
+<script>
+"use strict";
+const W = 1706, H = 922;
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+
+// ---------------------------------------------------------------------------
+// Geometry measured from the source art (image pixel coordinates)
+// ---------------------------------------------------------------------------
+const REEL_L = { x: 1108, y: 138 }, REEL_R = { x: 1258, y: 229 };
+const MID = { x: (REEL_L.x + REEL_R.x) / 2, y: (REEL_L.y + REEL_R.y) / 2 };
+const REEL_HALF = Math.hypot(REEL_R.x - REEL_L.x, REEL_R.y - REEL_L.y) / 2;
+const CAS_U = { x: (REEL_R.x - REEL_L.x) / (2 * REEL_HALF), y: (REEL_R.y - REEL_L.y) / (2 * REEL_HALF) };
+const CAS_V = { x: -CAS_U.y, y: CAS_U.x };
+const WIN = { u0: -39, u1: 39, v0: -19, v1: 15 };   // cassette window interior (cassette-local)
+
+// PLAY key: rounded square, top face drawn HEIGHT px "up-screen" from its footprint
+const BTN = {
+  x: 840, y: 340,                                  // top face centre at rest
+  u: { x: 0.866, y: 0.5 }, v: { x: -0.5, y: 0.866 },
+  half: 40, round: 7, height: 19, hdir: { x: 0.206, y: -0.979 },
+};
+const BTN_BASE = { x: BTN.x - BTN.hdir.x * BTN.height, y: BTN.y - BTN.hdir.y * BTN.height };
+const TRAVEL = 12;                                 // key travel (px of height)
+const LATCH = 0.62;                                // PLAY stays latched this deep
+
+// light comes from above, slightly left (matches the cassette case's painted shadow)
+const L3 = norm3(-0.27, -0.72, 0.62);
+const HV = norm3(L3.x, L3.y, L3.z + 1);
+const LIGHT2 = { x: -0.35, y: -0.937 };            // toward light, on the table plane
+const SHADOW2 = { x: 0.35, y: 0.937 };             // shadows fall this way
+const SHADOW_K = 1.5;                              // shadow offset per unit height
+
+// hand frame: B points from fingertip back to the wrist, T points to the hand's right
+const B = { x: -0.62, y: 0.785 };
+const T = { x: 0.785, y: 0.62 };
+const HAND_SCALE = 1.1;
+
+// tape packs (radii in image px)
+const HUB_R = 20, FULL_R = 95, PACK_AREA = FULL_R * FULL_R - HUB_R * HUB_R;
+const TAPE_V = 105;          // linear tape speed, px/s
+const SIDE_SECONDS = 150;    // one side, sped up so the packs visibly trade tape
+
+// ---------------------------------------------------------------------------
+// Palettes
+// ---------------------------------------------------------------------------
+const rgba = (r, g, b, a = 255) => ((a << 24) | (b << 16) | (g << 8) | r) >>> 0;
+const hex = h => { const n = parseInt(h.slice(1), 16); return rgba(n >> 16, (n >> 8) & 255, n & 255); };
+const ramp = a => a.map(hex);
+const SKIN  = ramp(["#3a1810", "#6b3225", "#984f3a", "#c07158", "#db9575", "#efb693", "#fbd6ba"]);
+const NAIL  = ramp(["#6b3225", "#c08779", "#ddaa9e", "#efc8bd", "#fbe4dc", "#ffffff"]);
+const CLOTH = ramp(["#0e1226", "#1c2441", "#2a375f", "#3b4c84", "#5165a4", "#6c80bf"]);
+const TAPE  = ramp(["#120a06", "#28180f", "#3c2416", "#53331e", "#6c4629", "#8a5f3b"]);
+const HUB   = ramp(["#262226", "#4a454b", "#77727a", "#a29da4", "#c9c5ca", "#eae7e9"]);
+const METAL = ramp(["#19181c", "#333138", "#57555e", "#86848d", "#bdbbc2"]);
+const INSIDE = ramp(["#0f0c10", "#19151a", "#231e25", "#2e2830", "#3b343e"]);
+const GLARE = hex("#d6d3da");
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + 0.5) / 16);
+const DITH = 0.8;   // per-call override keeps big skin areas flat
+
+function pick(pal, v, i, j, lo = 0, dith = DITH) {
+  let k = Math.floor(v + 0.5 + (BAYER[((j & 3) << 2) | (i & 3)] - 0.5) * dith);
+  return pal[k < lo ? lo : k >= pal.length ? pal.length - 1 : k];
+}
+function mix(a, b, k) {
+  const ch = s => Math.round(((a >>> s) & 255) * (1 - k) + ((b >>> s) & 255) * k);
+  return rgba(ch(0), ch(8), ch(16));
+}
+function norm3(x, y, z) { const l = Math.hypot(x, y, z); return { x: x / l, y: y / l, z: z / l }; }
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const hash = n => { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); };
+const easeOut3 = k => 1 - (1 - k) ** 3, easeIn3 = k => k ** 3, easeIn2 = k => k * k, easeOut2 = k => 1 - (1 - k) ** 2;
+
+// low-res pixel layers, upscaled with nearest-neighbour onto the main canvas
+function makeLayer(px) {
+  const w = Math.ceil(W / px), h = Math.ceil(H / px);
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const g = c.getContext("2d");
+  const img = g.createImageData(w, h);
+  return { px, w, h, c, g, img, buf: new Uint32Array(img.data.buffer) };
+}
+function flush(L) {
+  L.g.putImageData(L.img, 0, 0);
+  ctx.drawImage(L.c, 0, 0, L.w * L.px, L.h * L.px);
+}
+function cellBox(L, pts) {
+  let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+  for (const p of pts) { x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y); }
+  return [clamp(Math.floor(x0 / L.px), 0, L.w - 1), clamp(Math.ceil(x1 / L.px), 0, L.w - 1),
+          clamp(Math.floor(y0 / L.px), 0, L.h - 1), clamp(Math.ceil(y1 / L.px), 0, L.h - 1)];
+}
+const LR = makeLayer(3);   // reels + window: fine detail like the cassette label
+const LB = makeLayer(3);   // PLAY key
+const LS = makeLayer(6);   // hand shadow
+const LH = makeLayer(6);   // hand: chunky like the deck and table
+
+// ---------------------------------------------------------------------------
+// Reels and tape window
+// ---------------------------------------------------------------------------
+function tapeTone(r, lit) {
+  return 2.1 + (hash(Math.floor(r / 1.8)) - 0.5) * 0.9 + lit * 0.7;
+}
+// wind irregularities on the pack surface: they ride around with the reel
+function tapeSpeck(r, a) {
+  const h = hash(Math.floor(r / 2.4) * 91.7 + Math.floor(a * r / 5) * 13.3);
+  return h > 0.9 ? 1.3 : h < 0.07 ? -1.1 : 0;
+}
+const wrap = a => a - Math.floor(a / (2 * Math.PI)) * 2 * Math.PI;
+
+function renderReel(L, c, ang, packR) {
+  const px = L.px, HOLE = 27.5, SPOKE = 3.4;
+  const [i0, i1, j0, j1] = cellBox(L, [{ x: c.x - 30, y: c.y - 30 }, { x: c.x + 30, y: c.y + 30 }]);
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const x = (i + 0.5) * px - c.x, y = (j + 0.5) * px - c.y, r = Math.hypot(x, y);
+    if (r > HOLE) continue;
+    const lit = r > 0.01 ? (x * LIGHT2.x + y * LIGHT2.y) / r : 0;   // fixed: light doesn't turn
+    const a = wrap(Math.atan2(y, x) - ang);                          // turns with the hub
+    let col;
+    if (r > HUB_R + 0.5) {
+      if (r < packR) col = pick(TAPE, tapeTone(r, lit) + tapeSpeck(r, a), i, j);
+      else col = pick(INSIDE, 1.3 - lit * 0.4, i, j);
+      if (r > HOLE - 3.5 && lit > 0.2) col = mix(col, INSIDE[0], 0.6);   // label edge shadow
+    } else {
+      // white hub: ring + 3 chunky spokes + centre boss, over the dark drive hole
+      let spoke = false;
+      for (let k = 0; k < 3; k++) {
+        let d = a - k * 2 * Math.PI / 3;
+        d -= Math.round(d / (2 * Math.PI)) * 2 * Math.PI;
+        if (Math.abs(d) < Math.PI / 2 && r * Math.abs(Math.sin(d)) < SPOKE) { spoke = true; break; }
+      }
+      if (r > 12.5 || spoke || r < 5.5) {
+        let v = 3.4 + lit * 1.1;
+        if (r > HUB_R - 1.5) v -= 1.3;                       // outer rim
+        else if (r > 12 && r < 14) v -= 0.8;                 // inner lip of the ring
+        if (r > 14 && r < 18 && lit > 0.75) v += 1.2;        // fixed glint
+        col = pick(HUB, v, i, j);
+        if (r < 2.6) col = pick(METAL, 2 + lit, i, j);       // spindle tip
+      } else {
+        col = pick(INSIDE, r > 10 && lit < -0.3 ? 1.2 : 0.2, i, j);
+      }
+    }
+    L.buf[j * L.w + i] = col;
+  }
+}
+
+function renderWindow(L, RL, RR, thL, thR) {
+  const px = L.px, P = (u, v) => ({ x: MID.x + CAS_U.x * u + CAS_V.x * v, y: MID.y + CAS_U.y * u + CAS_V.y * v });
+  const [i0, i1, j0, j1] = cellBox(L, [P(WIN.u0, WIN.v0), P(WIN.u1, WIN.v0), P(WIN.u0, WIN.v1), P(WIN.u1, WIN.v1)]);
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const X = (i + 0.5) * px, Y = (j + 0.5) * px, dx = X - MID.x, dy = Y - MID.y;
+    const u = dx * CAS_U.x + dy * CAS_U.y, v = dx * CAS_V.x + dy * CAS_V.y;
+    if (u < WIN.u0 || u > WIN.u1 || v < WIN.v0 || v > WIN.v1) continue;
+    const dl = Math.hypot(u + REEL_HALF, v), dr = Math.hypot(u - REEL_HALF, v);
+    let col;
+    if (dl < RL || dr < RR) {
+      const left = dl < RL, d = left ? dl : dr, R = left ? RL : RR, c = left ? REEL_L : REEL_R;
+      const ex = (X - c.x) / d, ey = (Y - c.y) / d;
+      const a = wrap(Math.atan2(Y - c.y, X - c.x) - (left ? thL : thR));
+      col = pick(TAPE, tapeTone(d, ex * LIGHT2.x + ey * LIGHT2.y) + tapeSpeck(d, a), i, j);
+      if (R - d < 2.5) col = TAPE[R - d < 1.2 ? 5 : 0];   // pack edge catches light, then dark rim
+    } else {
+      col = pick(INSIDE, 2.6 + (v - WIN.v0) / (WIN.v1 - WIN.v0) * 0.9, i, j);
+    }
+    if (v < WIN.v0 + 3.5) col = mix(col, INSIDE[0], 0.5);   // label lip shadow
+    // static glare on the window plastic
+    const g = u * 0.42 + v;
+    const gs = Math.max(0, 1 - Math.abs(g + 3) / 7) * Math.max(0, 1 - Math.abs(u + 4) / 30);
+    if (gs > 0 && BAYER[((j & 3) << 2) | (i & 3)] < gs * 0.9) col = mix(col, GLARE, 0.3 + gs * 0.2);
+    L.buf[j * L.w + i] = col;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Hand: union of SDF parts in hand-local space (s: tip -> wrist, t: lateral)
+// ---------------------------------------------------------------------------
+function capsule(s, t, s1, t1, r1, s2, t2, r2) {
+  const ps = s - s1, pt = t - t1, bs = s2 - s1, bt = t2 - t1;
+  let h = (ps * bs + pt * bt) / (bs * bs + bt * bt);
+  h = h < 0 ? 0 : h > 1 ? 1 : h;
+  const ds = ps - bs * h, dt = pt - bt * h;
+  return Math.sqrt(ds * ds + dt * dt) - (r1 + (r2 - r1) * h);
+}
+function ellipse(s, t, cs, ct, rs, rt) {
+  const ps = s - cs, pt = t - ct;
+  const k0 = Math.hypot(ps / rs, pt / rt), k1 = Math.hypot(ps / (rs * rs), pt / (rt * rt));
+  return k1 < 1e-9 ? -Math.min(rs, rt) : k0 * (k0 - 1) / k1;
+}
+function smin(a, b, k) { const h = Math.max(k - Math.abs(a - b), 0) / k; return Math.min(a, b) - h * h * k * 0.25; }
+
+// bottom -> top draw order
+const P_THUMB = 0, P_HAND = 1, P_MID = 2, P_RING = 3, P_PINKY = 4, P_SLEEVE = 5, NPARTS = 6;
+const PART_RR = [20, 40, 20, 18, 15, 70];
+function sdPart(p, s, t, sq) {
+  switch (p) {
+    case P_THUMB: return capsule(s, t, 440, -25, 32, 250, -56, 21);
+    case P_HAND: {
+      const idx = capsule(s, t, 22, 0, 22 + sq * 2.5, 200, 2, 27);
+      const back = smin(ellipse(s, t, 325, 64, 150, 102), capsule(s, t, 430, 58, 80, 620, 58, 76), 50);
+      return smin(back, idx, 26);
+    }
+    case P_MID: return capsule(s, t, 158, 55, 23, 222, 58, 25);
+    case P_RING: return capsule(s, t, 176, 102, 21, 232, 104, 23);
+    case P_PINKY: return capsule(s, t, 197, 145, 17, 240, 143, 19);
+    case P_SLEEVE: return Math.max(capsule(s, t, 560, 58, 100, 1700, 80, 128), 548 - s);
+  }
+}
+function sdHand(s, t) { let d = 1e9; for (let p = 0; p < NPARTS; p++) d = Math.min(d, sdPart(p, s, t, 0)); return d; }
+
+// silhouette samples for the cast shadow, computed once
+const SHADOW_SAMPLES = [];
+for (let s = -4; s < 1150; s += 4) for (let t = -140; t < 230; t += 4)
+  if (sdHand(s, t) < 0) SHADOW_SAMPLES.push(s, t, 0.15 * Math.min(s, 700));
+const JITTER = [[0, 0], [1, 0], [-0.5, 0.87], [-0.5, -0.87], [0.5, 0.87], [0.5, -0.87]];
+
+function handFrame(hs) {
+  const sc = HAND_SCALE * (1 + 0.0025 * hs.h0);
+  // the pad rides the key face down; above it, height shows as a (damped) up-screen shift
+  const hp = hs.h0 - TRAVEL, face = keyFace(clamp(-hp / TRAVEL, 0, 1)), lift = Math.max(0, hp) * 0.4;
+  const ax = face.x + BTN.hdir.x * lift + B.x * hs.along + T.x * hs.lat;
+  const ay = face.y + BTN.hdir.y * lift + B.y * hs.along + T.y * hs.lat;
+  return { sc, tip: { x: ax - B.x * 22 * sc, y: ay - B.y * 22 * sc } };   // s=22 is the finger pad
+}
+function toScreen(f, s, t) { return { x: f.tip.x + f.sc * (s * B.x + t * T.x), y: f.tip.y + f.sc * (s * B.y + t * T.y) }; }
+
+function renderShadow(L, hs, f) {
+  const px = L.px, w = L.w, h = L.h, mask = SHADOW_MASK;
+  let i0 = w, i1 = -1, j0 = h, j1 = -1;
+  for (let k = 0; k < SHADOW_SAMPLES.length; k += 3) {
+    const s = SHADOW_SAMPLES[k], t = SHADOW_SAMPLES[k + 1], z = hs.h0 + SHADOW_SAMPLES[k + 2];
+    const off = z * SHADOW_K, spread = z * 0.13 + 1;
+    const bx = f.tip.x + f.sc * (s * B.x + t * T.x) + SHADOW2.x * off;
+    const by = f.tip.y + f.sc * (s * B.y + t * T.y) + SHADOW2.y * off;
+    for (let q = 0; q < JITTER.length; q++) {
+      const ci = Math.floor((bx + JITTER[q][0] * spread) / px), cj = Math.floor((by + JITTER[q][1] * spread) / px);
+      if (ci < 0 || cj < 0 || ci >= w || cj >= h) continue;
+      mask[cj * w + ci] |= 1 << q;
+      if (ci < i0) i0 = ci; if (ci > i1) i1 = ci; if (cj < j0) j0 = cj; if (cj > j1) j1 = cj;
+    }
+  }
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const m = mask[j * w + i];
+    if (!m) continue;
+    mask[j * w + i] = 0;
+    let n = 0; for (let b = m; b; b &= b - 1) n++;
+    const lvl = Math.floor((n / JITTER.length) * 3 + 0.5 + (BAYER[((j & 3) << 2) | (i & 3)] - 0.5) * 0.9);
+    if (lvl > 0) L.buf[j * w + i] = SHADOW_LEVELS[Math.min(3, lvl)];
+  }
+}
+const SHADOW_MASK = new Uint8Array(LS.w * LS.h);
+const SHADOW_LEVELS = [0, rgba(26, 10, 4, 85), rgba(22, 8, 4, 130), rgba(16, 5, 2, 170)];
+
+const DS = new Float64Array(NPARTS);
+function renderHand(L, hs, f) {
+  const px = L.px, inv = 1 / f.sc, sq = hs.squish;
+  const outline = px * inv * 0.95, ao = px * inv * 1.5;
+  const [i0, i1, j0, j1] = cellBox(L, [toScreen(f, -10, -150), toScreen(f, -10, 240), toScreen(f, 1700, -150), toScreen(f, 1700, 240)]);
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const dx = (i + 0.5) * px - f.tip.x, dy = (j + 0.5) * px - f.tip.y;
+    const s = (dx * B.x + dy * B.y) * inv, t = (dx * T.x + dy * T.y) * inv;
+    if (s < -12 || t < -150 || t > 240) continue;
+    let win = -1;
+    for (let p = NPARTS - 1; p >= 0; p--) {
+      const d = (p !== P_SLEEVE && s > 760) ? 1e9 : sdPart(p, s, t, sq);
+      DS[p] = d;
+      if (win < 0 && d < 0) win = p;
+    }
+    if (win < 0) continue;
+    const d = DS[win], pal = win === P_SLEEVE ? CLOTH : SKIN;
+    let col;
+    if (d > -outline) {
+      col = pal[0];
+    } else {
+      // dome normal from the SDF gradient and the depth inside the part
+      const gs = sdPart(win, s + 1, t, sq) - d, gt = sdPart(win, s, t + 1, sq) - d, gl = Math.hypot(gs, gt) || 1;
+      const gx = (gs * B.x + gt * T.x) / gl, gy = (gs * B.y + gt * T.y) / gl;
+      const xr = Math.min(0.9, 1 - Math.min(1, -d / PART_RR[win])), nz = Math.sqrt(1 - xr * xr);
+      const nx = gx * xr, ny = gy * xr;
+      const diff = Math.max(0, nx * L3.x + ny * L3.y + nz * L3.z);
+      const spec = Math.pow(Math.max(0, nx * HV.x + ny * HV.y + nz * HV.z), 18);
+      let v = 1 + (pal.length - 2) * (0.12 + 0.88 * diff) + spec * 0.9;
+      for (let q = win + 1; q < NPARTS; q++) if (DS[q] < ao) { v -= 1.2; break; }   // contact occlusion
+
+      if (win === P_SLEEVE) {
+        v += s < 600 ? ((Math.floor((t + 200) / 7) & 1) ? -0.7 : 0.15)
+                     : 0.55 * Math.sin(s * 0.045 + Math.sin(t * 0.035) * 2.2);
+        col = pick(pal, v, i, j, 1, 0.5);
+      } else {
+        if (win === P_HAND && s < 215 && Math.abs(t) < 30) {
+          for (const c of [70, 121, 127]) if (Math.abs(t) < 17 && Math.abs(s - c - 0.012 * t * t) < 2.4) v -= 1.3;
+          if (ellipse(s, t, 202, 4, 15, 12) < 0) v += 0.6;   // main knuckle
+        }
+        if (win === P_HAND && s > 235 && s < 420) {
+          // faint extensor tendons fanning from the knuckles to the wrist
+          for (const tk of [6, 56, 103, 144]) {
+            const tw = 50 + (tk - 60) * 0.3, k = (s - 235) / 185;
+            if (Math.abs(t - (tk + (tw - tk) * k)) < 3.2) { v += 0.55 * (1 - k); break; }
+          }
+        }
+        if (win >= P_MID && win <= P_PINKY) {
+          const front = [158, 176, 197][win - P_MID] - [23, 21, 17][win - P_MID];
+          v -= clamp((front + 26 - s) / 26, 0, 1) * 1.6;   // curling down, away from the light
+        }
+        col = pick(pal, v, i, j, 1, 0.2);
+        if (win === P_HAND) {
+          const nd = Math.max(ellipse(s, t, 26, 0, 21, 15.5), 6 - s);
+          if (nd < 0) {
+            if (nd > -2.6) col = SKIN[2];
+            else {
+              const nspec = Math.pow(Math.max(0, nx * HV.x + ny * HV.y + nz * HV.z), 10);
+              const nv = s < 9 ? 3.6 : 1.5 + diff * 1.5 + nspec * 1.6 + sq * 0.6;
+              col = pick(NAIL, nv, i, j, 1, 0.5);
+            }
+          }
+        }
+      }
+    }
+    L.buf[j * L.w + i] = col;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PLAY key: a procedural box drawn over the painted one
+// ---------------------------------------------------------------------------
+const KEY_FACE = ramp(["#6f6255", "#a29079", "#c6b294", "#dfcaab", "#ecdbc0", "#f8eedc"]);
+const KEY_WALL = ramp(["#2e2729", "#4c4345", "#6c6264", "#8b8282", "#aaa19e"]);
+const KEY_INK = hex("#2b2a32"), KEY_GRIP = hex("#9c774f"), KEY_GRIP_HI = hex("#d4b48b");
+const KEY_GAP = ramp(["#120b0c", "#1c1416", "#271e20"]);
+const KEY_OUTLINE = 6.5;  // the painted dark gap around the key
+
+function sdKey(u, v) {
+  const e = BTN.half - BTN.round;
+  const qx = Math.abs(u) - e, qy = Math.abs(v) - e;
+  return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - BTN.round;
+}
+// hand-placed play glyph (too small to rasterise cleanly), anchored to the face centre cell
+const PLAY_GLYPH = ["X......", "XXX....", "XXXXX..", "XXXXXXX", "XXXXXXX", "XXXXX..", "XXX....", "X......"];
+const GLYPH_AT = { i: 0, j: -8 };   // glyph's top-left cell, relative to the face centre cell
+
+function renderKey(L, depth) {
+  const px = L.px, h = BTN.height - TRAVEL * depth, R = BTN.half + 32;
+  const hu = BTN.hdir.x * BTN.u.x + BTN.hdir.y * BTN.u.y, hv = BTN.hdir.x * BTN.v.x + BTN.hdir.y * BTN.v.y;
+  const fc = keyFace(depth), gi = Math.round(fc.x / px) + GLYPH_AT.i, gj = Math.round(fc.y / px) + GLYPH_AT.j;
+  const [i0, i1, j0, j1] = cellBox(L, [{ x: BTN_BASE.x - R, y: BTN_BASE.y - R }, { x: BTN_BASE.x + R, y: BTN_BASE.y + R }]);
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const dx = (i + 0.5) * px - BTN_BASE.x, dy = (j + 0.5) * px - BTN_BASE.y;
+    const pu = dx * BTN.u.x + dy * BTN.u.y, pv = dx * BTN.v.x + dy * BTN.v.y;
+    // the painted key's footprint (box at rest, plus its dark gap) is what we own
+    let rest = 1e9;
+    for (let l = 0; l <= BTN.height; l += 1.5) rest = Math.min(rest, sdKey(pu - l * hu, pv - l * hv));
+    if (rest > KEY_OUTLINE) continue;
+    // march down from the top face: the highest surface hit is what the camera sees
+    let hit = -1;
+    for (let l = h; l >= 0; l -= 1) if (sdKey(pu - l * hu, pv - l * hv) < 0) { hit = l; break; }
+    let col;
+    if (hit < 0) {
+      col = rest > 1.5 ? KEY_GAP[0] : pick(KEY_GAP, 1.6 - depth, i, j);   // exposed well
+    } else {
+      const fu = pu - hit * hu, fv = pv - hit * hv, d = sdKey(fu, fv);
+      const gu = sdKey(fu + 1, fv) - d, gv = sdKey(fu, fv + 1) - d, gl = Math.hypot(gu, gv) || 1;
+      const nx = (gu * BTN.u.x + gv * BTN.v.x) / gl, ny = (gu * BTN.u.y + gv * BTN.v.y) / gl;
+      if (hit === h) {
+        // top face: flat with a rounded bevel, a bit duller the deeper it sits
+        const bev = clamp(1 + d / 6, 0, 1) * 0.75, nz = Math.sqrt(1 - bev * bev);
+        const lit = nx * bev * L3.x + ny * bev * L3.y + nz * L3.z;
+        col = pick(KEY_FACE, 3.1 + (lit - L3.z) * 4.5, i, j, 0, 0.4);
+        if (PLAY_GLYPH[j - gj] && PLAY_GLYPH[j - gj][i - gi] === "X") col = KEY_INK;
+        else for (const gvk of [13, 21, 29]) {
+          if (Math.abs(fu + 2) > 26) break;
+          if (Math.abs(fv - gvk) < 2) { col = KEY_GRIP; break; }
+          if (fv - gvk >= -3.8 && fv - gvk < -2) { col = KEY_GRIP_HI; break; }
+        }
+        col = mix(col, KEY_GAP[0], 0.14 * depth);   // sunk into the deck, it catches less light
+      } else {
+        // side wall: shaded by its facing, darker toward the deck (occlusion)
+        const lit = nx * L3.x + ny * L3.y;
+        col = pick(KEY_WALL, 3.1 + lit * 1.8 - (1 - hit / h) * 1.2 - depth * 0.4, i, j, 0, 0.6);
+        if (h - hit < 1.5) col = KEY_WALL[4];   // lip where the face meets the wall
+      }
+    }
+    L.buf[j * L.w + i] = col;
+  }
+}
+// where the top face's centre sits on screen for a given press depth
+function keyFace(depth) {
+  const h = BTN.height - TRAVEL * depth;
+  return { x: BTN_BASE.x + BTN.hdir.x * h, y: BTN_BASE.y + BTN.hdir.y * h };
+}
+
+// ---------------------------------------------------------------------------
+// Timeline + transport state
+// ---------------------------------------------------------------------------
+const TL = { enter0: 0.6, enter1: 2.2, press0: 2.75, press1: 2.95, hold1: 3.25, lift1: 3.55, exit1: 4.9 };
+const HOVER = 46;   // fingertip height while aiming
+function handAt(tau) {
+  const hs = { visible: true, along: 0, lat: 0, h0: HOVER, squish: 0 };
+  if (tau < TL.enter0 || tau > TL.exit1) { hs.visible = false; return hs; }
+  if (tau < TL.enter1) {
+    const e = easeOut3((tau - TL.enter0) / (TL.enter1 - TL.enter0));
+    hs.along = 950 * (1 - e); hs.lat = 110 * (1 - e) ** 2; hs.h0 = HOVER + 70 * (1 - e);
+  } else if (tau < TL.press0) {
+    const k = (tau - TL.enter1) / (TL.press0 - TL.enter1), b = Math.sin(k * Math.PI);
+    hs.along = 4 * b; hs.lat = -2 * b; hs.h0 = HOVER + 6 * b;          // settle + small wind-up
+  } else if (tau < TL.press1) {
+    hs.h0 = HOVER * (1 - easeIn2((tau - TL.press0) / (TL.press1 - TL.press0)));
+  } else if (tau < TL.hold1) {
+    hs.h0 = 0;
+  } else if (tau < TL.lift1) {
+    hs.h0 = 30 * easeOut2((tau - TL.hold1) / (TL.lift1 - TL.hold1));
+  } else {
+    const k = easeIn3((tau - TL.lift1) / (TL.exit1 - TL.lift1));
+    hs.along = 950 * k; hs.lat = -50 * k; hs.h0 = 30 + 70 * k;
+  }
+  hs.squish = clamp(1 - hs.h0 / 3, 0, 1);
+  return hs;
+}
+
+const S = {};
+function reset() {
+  Object.assign(S, { tau: 0, latched: false, ended: false, endT: 0, depth: 0, spin: 0, p: 0.04, thL: 0.7, thR: 2.1 });
+}
+reset();
+
+function packs() {
+  return { RL: Math.sqrt(FULL_R * FULL_R - PACK_AREA * S.p), RR: Math.sqrt(HUB_R * HUB_R + PACK_AREA * S.p) };
+}
+
+function update(dt) {
+  S.tau += dt;
+  const hs = handAt(S.tau);
+  const contact = hs.visible ? clamp((TRAVEL - hs.h0) / TRAVEL, 0, 1) : 0;
+  if (contact > 0.97 && !S.latched && !S.ended) S.latched = true;
+  const target = Math.max(contact, S.latched ? LATCH : 0);
+  S.depth = target > S.depth ? target : S.depth + (target - S.depth) * Math.min(1, dt * 30);
+
+  // capstan motor spins up fast; brakes stop the hubs even faster
+  S.spin += ((S.latched ? 1 : 0) - S.spin) * (1 - Math.exp(-dt / (S.latched ? 0.16 : 0.05)));
+  const flutter = 1 + 0.006 * Math.sin(S.tau * 2 * Math.PI * 0.9) + 0.003 * Math.sin(S.tau * 2 * Math.PI * 6.3);
+  const sp = S.spin * flutter;
+  S.p = Math.min(1, S.p + sp * dt / SIDE_SECONDS);
+  const { RL, RR } = packs();
+  S.thL -= TAPE_V * sp * dt / RL;   // both hubs turn counter-clockwise when playing
+  S.thR -= TAPE_V * sp * dt / RR;
+
+  if (S.p >= 1 && S.latched) { S.latched = false; S.ended = true; S.endT = S.tau; }   // auto-stop pops PLAY
+  if (S.ended && S.tau - S.endT > 2.5) reset();
+  return hs;
+}
+
+let bg = null, lastHand = handAt(0);
+function render() {
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(bg, 0, 0);
+  LB.buf.fill(0); renderKey(LB, S.depth); flush(LB);
+
+  const { RL, RR } = packs();
+  LR.buf.fill(0);
+  renderWindow(LR, RL, RR, S.thL, S.thR);
+  renderReel(LR, REEL_L, S.thL, RL);
+  renderReel(LR, REEL_R, S.thR, RR);
+  flush(LR);
+
+  if (lastHand.visible) {
+    const f = handFrame(lastHand);
+    LS.buf.fill(0); renderShadow(LS, lastHand, f); flush(LS);
+    LH.buf.fill(0); renderHand(LH, lastHand, f); flush(LH);
+  }
+}
+
+// #t=3.0 freezes the scene at that time (handy for stills)
+const freezeAt = parseFloat(new URLSearchParams(location.hash.slice(1)).get("t"));
+function start() {
+  if (!isNaN(freezeAt)) {
+    for (let t = 0; t < freezeAt; t += 1 / 60) lastHand = update(1 / 60);
+    render();
+    return;
+  }
+  let prev = performance.now();
+  const frame = now => {
+    const dt = Math.min(0.05, (now - prev) / 1000); prev = now;
+    lastHand = update(dt);
+    render();
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+cv.addEventListener("click", () => { reset(); lastHand = handAt(0); });
+
+const img = new Image();
+img.onload = () => { bg = img; start(); };
+img.src = "dadalife.webp";
+</script>
+</body>
+</html>
